@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -69,7 +70,16 @@ def evaluate(model, loader, device):
     }
 
 
-def write_model_card(args, output_dir: Path, best_loss: float, best_metrics: dict) -> None:
+MODEL_NAMES = ("simple_cnn", "shared_bilinear", "multiview_bilinear")
+
+
+def model_names_from_args(args) -> list[str]:
+    if args.model == "all":
+        return list(MODEL_NAMES)
+    return [args.model]
+
+
+def write_model_card(args, model_name: str, output_dir: Path, best_loss: float, best_metrics: dict) -> None:
     card_path = output_dir / "README.md"
     card_path.write_text(
         "\n".join(
@@ -93,7 +103,7 @@ def write_model_card(args, output_dir: Path, best_loss: float, best_metrics: dic
                 "",
                 "## Training Configuration",
                 "",
-                f"- model: `{args.model}`",
+                f"- model: `{model_name}`",
                 f"- backbone: `{args.backbone_name}`",
                 f"- pretrained backbone: `{args.pretrained}`",
                 f"- feature_dim: `{args.feature_dim}`",
@@ -148,7 +158,81 @@ def push_output_to_hub(args, output_dir: Path) -> None:
     print(f"Uploaded model artifacts to https://huggingface.co/{args.hub_repo_id}")
 
 
-def train(args):
+def flatten_summary_for_csv(summary: dict) -> dict:
+    metrics = summary.get("best_metrics", {})
+    xyz = metrics.get("xyz_mae_mm", [None, None, None])
+    rpy = metrics.get("rpy_mae_deg", [None, None, None])
+    xyz_values = [float(value) for value in xyz if value is not None]
+    rpy_values = [float(value) for value in rpy if value is not None]
+    mean_xyz_mae_mm = sum(xyz_values) / len(xyz_values) if xyz_values else None
+    mean_rpy_mae_deg = sum(rpy_values) / len(rpy_values) if rpy_values else None
+    rpy_score_weight = float(summary.get("rpy_score_weight", 1.0))
+    selection_score = None
+    if mean_xyz_mae_mm is not None and mean_rpy_mae_deg is not None:
+        selection_score = mean_xyz_mae_mm + rpy_score_weight * mean_rpy_mae_deg
+    return {
+        "model": summary.get("model"),
+        "selection_score": selection_score,
+        "mean_xyz_mae_mm": mean_xyz_mae_mm,
+        "mean_rpy_mae_deg": mean_rpy_mae_deg,
+        "best_loss": summary.get("best_loss"),
+        "x_mae_mm": xyz[0] if len(xyz) > 0 else None,
+        "y_mae_mm": xyz[1] if len(xyz) > 1 else None,
+        "z_mae_mm": xyz[2] if len(xyz) > 2 else None,
+        "roll_mae_deg": rpy[0] if len(rpy) > 0 else None,
+        "pitch_mae_deg": rpy[1] if len(rpy) > 1 else None,
+        "yaw_mae_deg": rpy[2] if len(rpy) > 2 else None,
+        "best_checkpoint": summary.get("best_checkpoint"),
+    }
+
+
+def write_comparison_files(output_dir: Path, summaries: list[dict]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not summaries:
+        raise ValueError("No model summaries were produced.")
+    rows = [flatten_summary_for_csv(summary) for summary in summaries]
+    rows = sorted(
+        rows,
+        key=lambda item: (
+            float(item["selection_score"]) if item["selection_score"] is not None else float("inf"),
+            float(item["best_loss"]) if item["best_loss"] is not None else float("inf"),
+        ),
+    )
+    sorted_summaries = []
+    for row in rows:
+        summary = next(summary for summary in summaries if summary.get("model") == row["model"])
+        summary = dict(summary)
+        summary["selection_score"] = row["selection_score"]
+        summary["mean_xyz_mae_mm"] = row["mean_xyz_mae_mm"]
+        summary["mean_rpy_mae_deg"] = row["mean_rpy_mae_deg"]
+        sorted_summaries.append(summary)
+    (output_dir / "model_comparison.json").write_text(
+        json.dumps(sorted_summaries, indent=2),
+        encoding="utf-8",
+    )
+
+    csv_path = output_dir / "model_comparison.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print("\n=== Model Comparison (sorted by selection_score) ===")
+    for row in rows:
+        score_text = f"{float(row['selection_score']):.6f}" if row["selection_score"] is not None else "nan"
+        loss_text = f"{float(row['best_loss']):.6f}" if row["best_loss"] is not None else "nan"
+        print(
+            f"{row['model']}: score={score_text}, "
+            f"mean_xyz_mae_mm={row['mean_xyz_mae_mm']}, "
+            f"mean_rpy_mae_deg={row['mean_rpy_mae_deg']}, "
+            f"loss={loss_text}, "
+            f"xyz_mae_mm=({row['x_mae_mm']}, {row['y_mae_mm']}, {row['z_mae_mm']}), "
+            f"rpy_mae_deg=({row['roll_mae_deg']}, {row['pitch_mae_deg']}, {row['yaw_mae_deg']})"
+        )
+    print(f"Saved comparison: {csv_path}")
+
+
+def train_one_model(args, model_name: str, output_dir: Path) -> dict:
     seed_everything(args.seed, deterministic=args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     generator = make_generator(args.seed)
@@ -175,7 +259,7 @@ def train(args):
     )
 
     model = build_model(
-        args.model,
+        model_name,
         feature_dim=args.feature_dim,
         backbone_name=args.backbone_name,
         pretrained=args.pretrained,
@@ -188,11 +272,15 @@ def train(args):
         patience=3,
     )
     loss_fn = nn.SmoothL1Loss()
-    output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
     best_metrics = {}
-    best_checkpoint_path = output_dir / f"{args.model}_best.pt"
+    best_checkpoint_path = output_dir / f"{model_name}_best.pt"
+    summary_path = output_dir / "training_summary.json"
+
+    if args.skip_existing and best_checkpoint_path.exists() and summary_path.exists():
+        print(f"[Skip] Existing model found: {best_checkpoint_path}")
+        return json.loads(summary_path.read_text(encoding="utf-8"))
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -218,7 +306,7 @@ def train(args):
             torch.save(
                 {
                     "model": model.state_dict(),
-                    "model_name": args.model,
+                    "model_name": model_name,
                     "backbone_name": args.backbone_name,
                     "pretrained": args.pretrained,
                     "feature_dim": args.feature_dim,
@@ -238,7 +326,7 @@ def train(args):
         )
 
     summary = {
-        "model": args.model,
+        "model": model_name,
         "backbone_name": args.backbone_name,
         "pretrained": args.pretrained,
         "feature_dim": args.feature_dim,
@@ -251,14 +339,29 @@ def train(args):
         "seed": args.seed,
         "best_loss": best_loss,
         "best_metrics": best_metrics,
+        "rpy_score_weight": args.rpy_score_weight,
         "best_checkpoint": str(best_checkpoint_path),
     }
-    (output_dir / "training_summary.json").write_text(
+    summary_path.write_text(
         json.dumps(summary, indent=2),
         encoding="utf-8",
     )
-    write_model_card(args, output_dir, best_loss, best_metrics)
-    push_output_to_hub(args, output_dir)
+    write_model_card(args, model_name, output_dir, best_loss, best_metrics)
+    return summary
+
+
+def train(args):
+    root_output_dir = Path(args.output_dir).expanduser()
+    selected_models = model_names_from_args(args)
+    summaries = []
+
+    for model_name in selected_models:
+        model_output_dir = root_output_dir / model_name if len(selected_models) > 1 else root_output_dir
+        print(f"\n=== Training {model_name} ===")
+        summaries.append(train_one_model(args, model_name, model_output_dir))
+
+    write_comparison_files(root_output_dir, summaries)
+    push_output_to_hub(args, root_output_dir)
 
 
 def parse_args():
@@ -267,7 +370,7 @@ def parse_args():
     parser.add_argument("--dataset-hf-repo-id", default="aic-sejong-team/aic-vision-offset-dataset")
     parser.add_argument("--dataset-hf-revision", default=None)
     parser.add_argument("--output-dir", default="./checkpoints")
-    parser.add_argument("--model", choices=["simple_cnn", "shared_bilinear", "multiview_bilinear"], required=True)
+    parser.add_argument("--model", choices=["simple_cnn", "shared_bilinear", "multiview_bilinear", "all"], required=True)
     parser.add_argument("--connectors", default="SFP,SC")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--backbone-name", default="efficientnetv2_rw_s")
@@ -277,19 +380,20 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--rpy-score-weight", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--push-to-hub", action="store_true")
-    parser.add_argument("--hub-repo-id", default=None)
+    parser.add_argument("--hub-repo-id", default="aic-sejong-team/aic-vision-offset-models")
     parser.add_argument("--hub-revision", default=None)
     parser.add_argument("--hub-path-in-repo", default=".")
     parser.add_argument("--hub-commit-message", default="Upload AIC vision-offset model")
     parser.add_argument("--hub-private", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--hub-token", default=None)
     return parser.parse_args()
-
 
 if __name__ == "__main__":
     train(parse_args())

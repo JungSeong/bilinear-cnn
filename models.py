@@ -102,10 +102,10 @@ def bilinear_pool(feature_map: torch.Tensor) -> torch.Tensor:
     """Compute normalized bilinear outer-product descriptor."""
     batch, channels, height, width = feature_map.shape
     descriptors = feature_map.reshape(batch, channels, height * width)
-    pooled = torch.bmm(descriptors, descriptors.transpose(1, 2))
-    pooled = pooled / float(height * width)
+    pooled = torch.bmm(descriptors, descriptors.transpose(1, 2)) # binlinear outer product
+    pooled = pooled / float(height * width) # average pooling
     pooled = pooled.reshape(batch, channels * channels)
-    pooled = torch.sign(pooled) * torch.sqrt(torch.abs(pooled) + 1e-5)
+    pooled = torch.sign(pooled) * torch.sqrt(torch.abs(pooled) + 1e-5)  
     return F.normalize(pooled, dim=1)
 
 
@@ -222,7 +222,7 @@ class MultiViewBilinearCNNRegressor(nn.Module):
         feature_dim: int = 128,
         output_dim: int = 6,
         num_views: int = 3,
-        share_backbone_weights: bool = False,
+        share_backbone_weights: bool = True,
         backbone_name: str = "efficientnetv2_rw_s",
         pretrained: bool = True,
     ) -> None:

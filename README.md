@@ -1,6 +1,6 @@
 # AIC Bilinear CNN
 
-PortOffsetCollect가 생성한 `vision_offset_dataset`으로 FinalPolicy ALIGN 단계에서 사용할 6D correction 모델을 학습하는 실험 코드
+AIC_Sejong 프로젝트에서 데이터 생성 노드로 생성한 `vision_offset_dataset`으로 FinalPolicy ALIGN 단계에서 사용할 6D correction 모델을 학습하는 실험 코드
 
 ## Dataset
 
@@ -68,6 +68,51 @@ pip install -r /home/swlinux/Desktop/cool-library/bilinear-cnn/ais_bilinear-cnn/
 cd /home/swlinux/Desktop/cool-library/bilinear-cnn/ais_bilinear-cnn
 
 python3 train.py \
+  --model all \
+  --backbone-name efficientnetv2_rw_s \
+  --dataset-root /home/swlinux/Desktop/workspace/AIC_Sejong/data/vision_offset_dataset \
+  --output-dir checkpoints
+```
+
+`--model all`은 아래 3개 모델을 순서대로 학습하고 `checkpoints/` 아래에 모델별 폴더를 만듭니다.
+
+```text
+checkpoints/
+  simple_cnn/
+    simple_cnn_best.pt
+    training_summary.json
+  shared_bilinear/
+    shared_bilinear_best.pt
+    training_summary.json
+  multiview_bilinear/
+    multiview_bilinear_best.pt
+    training_summary.json
+  model_comparison.csv
+  model_comparison.json
+```
+
+이미 학습된 모델을 건너뛰고 비교표만 다시 만들고 싶다면 `--skip-existing`을 추가합니다.
+
+`model_comparison.csv`에는 축별 MAE와 함께 최종 선택용 컬럼이 같이 저장됩니다.
+
+```text
+selection_score = mean_xyz_mae_mm + rpy_score_weight * mean_rpy_mae_deg
+```
+
+기본 `rpy_score_weight`는 `1.0`입니다. 위치 오차를 더 우선하고 싶으면 작은 값을 줄 수 있습니다.
+
+```bash
+python3 train.py \
+  --model all \
+  --rpy-score-weight 0.5 \
+  --output-dir checkpoints \
+  --skip-existing
+```
+
+개별 모델만 학습할 수도 있습니다.
+
+```bash
+python3 train.py \
   --model simple_cnn \
   --backbone-name efficientnetv2_rw_s \
   --dataset-root /home/swlinux/Desktop/workspace/AIC_Sejong/data/vision_offset_dataset \
@@ -113,7 +158,7 @@ pip install -r /kaggle/working/bilinear-cnn/ais_bilinear-cnn/requirements.txt
 cd /kaggle/working/bilinear-cnn/ais_bilinear-cnn
 
 python train.py \
-  --model multiview_bilinear \
+  --model all \
   --dataset-root /kaggle/working/vision_offset_dataset \
   --dataset-hf-repo-id aic-sejong-team/aic-vision-offset-dataset \
   --output-dir /kaggle/working/aic_vision_offset_checkpoints \
@@ -125,14 +170,14 @@ python train.py \
 
 학습 종료 후 best checkpoint, `training_summary.json`, model card를 HuggingFace model repo로
 올리려면 `--push-to-hub`를 추가합니다.
+기본 업로드 대상 repo는 `aic-sejong-team/aic-vision-offset-models`입니다.
 
 ```bash
 python train.py \
-  --model multiview_bilinear \
+  --model all \
   --dataset-root /kaggle/working/vision_offset_dataset \
   --output-dir /kaggle/working/aic_vision_offset_checkpoints \
   --push-to-hub \
-  --hub-repo-id aic-sejong-team/aic-vision-offset-models \
   --hub-private
 ```
 
