@@ -149,8 +149,12 @@ os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 의존성 설치:
 
 ```bash
-pip install -r /kaggle/working/bilinear-cnn/ais_bilinear-cnn/requirements.txt
+pip install -q -r /kaggle/working/bilinear-cnn/ais_bilinear-cnn/requirements-kaggle.txt
 ```
+
+Kaggle에는 이미 `torch`, `torchvision`, `numpy`, `pillow`가 설치되어 있습니다.
+전체 `requirements.txt`를 설치하면 Kaggle의 CUDA/RAPIDS 패키지와 충돌 경고가 날 수 있으므로
+Kaggle에서는 `requirements-kaggle.txt`를 사용합니다.
 
 학습 예시:
 
