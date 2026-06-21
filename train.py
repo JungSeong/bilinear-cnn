@@ -217,7 +217,12 @@ def format_epoch_log(
     )
 
 
-MODEL_NAMES = ("simple_cnn", "shared_bilinear", "multiview_bilinear")
+MODEL_NAMES = (
+    "simple_cnn",
+    "shared_bilinear",
+    "multiview_bilinear",
+    "cross_attention_bilinear",
+)
 
 
 def model_names_from_args(args) -> list[str]:
@@ -256,6 +261,10 @@ def write_model_card(
                 f"- feature_dim: `{args.feature_dim}`",
                 f"- image_size: `{args.image_size}`",
                 f"- share backbone weights (multiview only): `{args.share_backbone_weights}`",
+                f"- attention heads: `{args.attention_heads}`",
+                f"- attention layers: `{args.attention_layers}`",
+                f"- attention dropout: `{args.attention_dropout}`",
+                f"- attention pos grid: `{args.attention_pos_grid}`",
                 f"- requested connectors: `{args.connectors}`",
                 f"- dataset repo: `{args.dataset_hf_repo_id}`",
                 f"- dataset revision: `{args.dataset_hf_revision}`",
@@ -338,6 +347,58 @@ def write_loss_artifacts(output_dir: Path, model_name: str, history: list[dict])
     return history_path, curve_path
 
 
+def write_training_curves_overview(output_dir: Path, summaries: list[dict]) -> Path | None:
+    curve_path = output_dir / "model_training_curves.png"
+    plot_summaries = [summary for summary in summaries if summary.get("history")]
+    if not plot_summaries:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plots = [
+        ("total loss", "train_loss", "val_loss", "SmoothL1"),
+        ("mean xyz MAE", "train_mean_xyz_mae_mm", "val_mean_xyz_mae_mm", "mm"),
+        ("mean rpy MAE", "train_mean_rpy_mae_deg", "val_mean_rpy_mae_deg", "deg"),
+    ]
+    fig, axes = plt.subplots(len(plots), 1, figsize=(10, 11), sharex=True)
+    fig.suptitle("Model train/val curves")
+    for ax, (title, train_key, val_key, ylabel) in zip(axes, plots):
+        for summary in plot_summaries:
+            history = summary["history"]
+            epochs = [row["epoch"] for row in history]
+            train_values = [row.get(train_key) for row in history]
+            val_values = [row.get(val_key) for row in history]
+            if any(value is None for value in (*train_values, *val_values)):
+                continue
+            label = f"{summary.get('connector')}/{summary.get('model')}"
+            ax.plot(
+                epochs,
+                train_values,
+                linewidth=1.5,
+                alpha=0.8,
+                label=f"{label} train",
+            )
+            ax.plot(
+                epochs,
+                val_values,
+                linewidth=1.8,
+                linestyle="--",
+                label=f"{label} val",
+            )
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("epoch")
+    axes[0].legend(fontsize=7, ncol=2)
+    fig.tight_layout()
+    fig.savefig(curve_path, dpi=150)
+    plt.close(fig)
+    return curve_path
+
+
 def push_output_to_hub(args, output_dir: Path) -> None:
     if not args.push_to_hub:
         return
@@ -360,6 +421,14 @@ def push_output_to_hub(args, output_dir: Path) -> None:
         private=args.hub_private,
         exist_ok=True,
     )
+    if args.hub_revision:
+        print(f"Ensuring Hub branch exists: {args.hub_repo_id}@{args.hub_revision}")
+        api.create_branch(
+            repo_id=args.hub_repo_id,
+            repo_type="model",
+            branch=args.hub_revision,
+            exist_ok=True,
+        )
     api.upload_folder(
         repo_id=args.hub_repo_id,
         repo_type="model",
@@ -397,6 +466,8 @@ def flatten_summary_for_csv(summary: dict) -> dict:
         "pitch_mae_deg": rpy[1] if len(rpy) > 1 else None,
         "yaw_mae_deg": rpy[2] if len(rpy) > 2 else None,
         "best_checkpoint": summary.get("best_checkpoint"),
+        "loss_history": summary.get("loss_history"),
+        "loss_curve": summary.get("loss_curve"),
     }
 
 
@@ -424,6 +495,13 @@ def write_comparison_files(output_dir: Path, summaries: list[dict]) -> None:
         summary["mean_xyz_mae_mm"] = row["mean_xyz_mae_mm"]
         summary["mean_rpy_mae_deg"] = row["mean_rpy_mae_deg"]
         sorted_summaries.append(summary)
+    overview_curve_path = write_training_curves_overview(output_dir, sorted_summaries)
+    if overview_curve_path is not None:
+        overview_curve_text = str(overview_curve_path)
+        for row in rows:
+            row["training_curves_overview"] = overview_curve_text
+        for summary in sorted_summaries:
+            summary["training_curves_overview"] = overview_curve_text
     (output_dir / "model_comparison.json").write_text(
         json.dumps(sorted_summaries, indent=2),
         encoding="utf-8",
@@ -448,6 +526,8 @@ def write_comparison_files(output_dir: Path, summaries: list[dict]) -> None:
             f"rpy_mae_deg=({row['roll_mae_deg']}, {row['pitch_mae_deg']}, {row['yaw_mae_deg']})"
         )
     print(f"Saved comparison: {csv_path}")
+    if overview_curve_path is not None:
+        print(f"Saved training curves overview: {overview_curve_path}")
 
 
 def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> dict:
@@ -482,6 +562,10 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
         backbone_name=args.backbone_name,
         pretrained=args.pretrained,
         share_backbone_weights=args.share_backbone_weights,
+        attention_heads=args.attention_heads,
+        attention_layers=args.attention_layers,
+        attention_dropout=args.attention_dropout,
+        attention_pos_grid=args.attention_pos_grid,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -566,6 +650,10 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
                     "feature_dim": args.feature_dim,
                     "image_size": args.image_size,
                     "share_backbone_weights": args.share_backbone_weights,
+                    "attention_heads": args.attention_heads,
+                    "attention_layers": args.attention_layers,
+                    "attention_dropout": args.attention_dropout,
+                    "attention_pos_grid": args.attention_pos_grid,
                     "xyz_loss_scale_mm": args.xyz_loss_scale_mm,
                     "rpy_loss_scale_deg": args.rpy_loss_scale_deg,
                     "xyz_loss_weight": args.xyz_loss_weight,
@@ -612,6 +700,10 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
         "feature_dim": args.feature_dim,
         "image_size": args.image_size,
         "share_backbone_weights": args.share_backbone_weights,
+        "attention_heads": args.attention_heads,
+        "attention_layers": args.attention_layers,
+        "attention_dropout": args.attention_dropout,
+        "attention_pos_grid": args.attention_pos_grid,
         "xyz_loss_scale_mm": args.xyz_loss_scale_mm,
         "rpy_loss_scale_deg": args.rpy_loss_scale_deg,
         "xyz_loss_weight": args.xyz_loss_weight,
@@ -650,11 +742,7 @@ def train(args):
 
     for connector in selected_connectors:
         for model_name in selected_models:
-            model_output_dir = root_output_dir
-            if len(selected_connectors) > 1:
-                model_output_dir = model_output_dir / connector
-            if len(selected_models) > 1:
-                model_output_dir = model_output_dir / model_name
+            model_output_dir = root_output_dir / connector / model_name
             print(f"\n=== Training {connector}/{model_name} ===")
             summaries.append(train_one_model(args, model_name, connector, model_output_dir))
 
@@ -668,7 +756,17 @@ def parse_args():
     parser.add_argument("--dataset-hf-repo-id", default="aic-sejong-team/aic-vision-offset-dataset")
     parser.add_argument("--dataset-hf-revision", default=None)
     parser.add_argument("--output-dir", default="./checkpoints")
-    parser.add_argument("--model", choices=["simple_cnn", "shared_bilinear", "multiview_bilinear", "all"], required=True)
+    parser.add_argument(
+        "--model",
+        choices=[
+            "simple_cnn",
+            "shared_bilinear",
+            "multiview_bilinear",
+            "cross_attention_bilinear",
+            "all",
+        ],
+        required=True,
+    )
     parser.add_argument(
         "--connectors",
         default="all",
@@ -694,6 +792,10 @@ def parse_args():
         default=True,
         metavar="{true|false}",
     )
+    parser.add_argument("--attention-heads", type=int, default=8)
+    parser.add_argument("--attention-layers", type=int, default=2)
+    parser.add_argument("--attention-dropout", type=float, default=0.1)
+    parser.add_argument("--attention-pos-grid", type=int, default=7)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--early-stopping-patience", type=int, default=20)

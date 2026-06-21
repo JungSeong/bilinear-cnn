@@ -109,6 +109,38 @@ def bilinear_pool(feature_map: torch.Tensor) -> torch.Tensor:
     return F.normalize(pooled, dim=1)
 
 
+def bilinear_pool_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    """Compute normalized bilinear descriptor from [B, tokens, channels]."""
+    batch, token_count, channels = tokens.shape
+    descriptors = tokens.transpose(1, 2).contiguous()
+    pooled = torch.bmm(descriptors, descriptors.transpose(1, 2))
+    pooled = pooled / float(token_count)
+    pooled = pooled.reshape(batch, channels * channels)
+    pooled = torch.sign(pooled) * torch.sqrt(torch.abs(pooled) + 1e-5)
+    return F.normalize(pooled, dim=1)
+
+
+class CrossAttentionBlock(nn.Module):
+    """Residual cross-attention block used between view token streams."""
+
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+    def forward(self, query_tokens: torch.Tensor, kv_tokens: torch.Tensor) -> torch.Tensor:
+        query = self.norm_q(query_tokens)
+        key_value = self.norm_kv(kv_tokens)
+        attn_out, _ = self.attn(query, key_value, key_value, need_weights=False)
+        return query_tokens + attn_out
+
+
 class SimpleCNNRegressor(nn.Module):
     """Plain timm CNN baseline without view-specific branches.
 
@@ -277,12 +309,131 @@ class MultiViewBilinearCNNRegressor(nn.Module):
         return self.head(fused)
 
 
+class MultiViewBidirectionalCrossAttentionBilinearRegressor(nn.Module):
+    """Cross-attended multiview tokens followed by per-view bilinear pooling.
+
+    Each view attends to the other views,
+    then each refined token stream is converted to a bilinear descriptor.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 128,
+        output_dim: int = 6,
+        num_views: int = 3,
+        backbone_name: str = "efficientnetv2_rw_s",
+        pretrained: bool = True,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        pos_grid: int = 7,
+    ) -> None:
+        super().__init__()
+        if feature_dim % num_heads != 0:
+            raise ValueError(
+                "feature_dim must be divisible by num_heads for cross attention"
+            )
+
+        self.num_views = num_views
+        self.feature_dim = feature_dim
+        self.backbone = TimmFeatureBackbone(
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+            feature_dim=feature_dim,
+        )
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, feature_dim, pos_grid, pos_grid) * 0.02
+        )
+        self.cross_layers = nn.ModuleList(
+            [
+                nn.ModuleList(
+                    [
+                        CrossAttentionBlock(feature_dim, num_heads, dropout)
+                        for _ in range(num_views)
+                    ]
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.token_norms = nn.ModuleList(
+            [nn.LayerNorm(feature_dim) for _ in range(num_views)]
+        )
+
+        descriptor_dim = num_views * feature_dim * feature_dim
+        self.head = nn.Sequential(
+            nn.Linear(descriptor_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.35),
+            nn.Linear(1024, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, output_dim),
+        )
+
+    def _to_tokens(self, feature_map: torch.Tensor) -> torch.Tensor:
+        pos = F.interpolate(
+            self.pos_embed,
+            size=feature_map.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        feature_map = feature_map + pos
+        return feature_map.flatten(2).transpose(1, 2)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if images.dim() != 5:
+            raise ValueError(
+                "MultiViewBidirectionalCrossAttentionBilinearRegressor expects "
+                "[B, V, 3, H, W] input"
+            )
+        batch, views, channels, height, width = images.shape
+        if views != self.num_views:
+            raise ValueError(f"Expected {self.num_views} views, got {views}")
+
+        flat = images.reshape(batch * views, channels, height, width)
+        features = self.backbone(flat)
+        _, feature_channels, feature_h, feature_w = features.shape
+        features = features.reshape(
+            batch,
+            views,
+            feature_channels,
+            feature_h,
+            feature_w,
+        )
+        tokens = [self._to_tokens(features[:, view_index]) for view_index in range(views)]
+
+        for layer in self.cross_layers:
+            previous_tokens = tokens
+            next_tokens = []
+            for view_index, block in enumerate(layer):
+                other_tokens = torch.cat(
+                    [
+                        previous_tokens[other_index]
+                        for other_index in range(views)
+                        if other_index != view_index
+                    ],
+                    dim=1,
+                )
+                next_tokens.append(block(previous_tokens[view_index], other_tokens))
+            tokens = next_tokens
+
+        descriptors = [
+            bilinear_pool_tokens(self.token_norms[view_index](view_tokens))
+            for view_index, view_tokens in enumerate(tokens)
+        ]
+        fused = torch.cat(descriptors, dim=1)
+        return self.head(fused)
+
+
 def build_model(
     name: str,
     feature_dim: int = 128,
     backbone_name: str = "efficientnetv2_rw_s",
     pretrained: bool = True,
     share_backbone_weights: bool = True,
+    attention_heads: int = 8,
+    attention_layers: int = 2,
+    attention_dropout: float = 0.1,
+    attention_pos_grid: int = 7,
 ) -> nn.Module:
     name = name.strip().lower()
     if name in {"simple", "simple_cnn"}:
@@ -304,7 +455,21 @@ def build_model(
             pretrained=pretrained,
             share_backbone_weights=share_backbone_weights,
         )
+    if name in {
+        "cross_attention_bilinear",
+        "bidirectional_cross_attention_bilinear",
+        "mv_bca_bilinear",
+    }:
+        return MultiViewBidirectionalCrossAttentionBilinearRegressor(
+            feature_dim=feature_dim,
+            backbone_name=backbone_name,
+            pretrained=pretrained,
+            num_heads=attention_heads,
+            num_layers=attention_layers,
+            dropout=attention_dropout,
+            pos_grid=attention_pos_grid,
+        )
     raise ValueError(
         "Unknown model name. Use one of: simple_cnn, shared_bilinear, "
-        "multiview_bilinear"
+        "multiview_bilinear, cross_attention_bilinear"
     )

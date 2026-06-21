@@ -40,16 +40,21 @@ Input/output: 3-view image -> [x_m, y_m, z_m, roll_rad, pitch_rad, yaw_rad]
 | `simple_cnn` | shared timm backbone | mean feature map -> global average pooling |
 | `shared_bilinear` | shared timm backbone | mean feature map -> one bilinear descriptor |
 | `multiview_bilinear` | shared by default, optional per-view backbone | per-view bilinear descriptors -> concat |
+| `cross_attention_bilinear` | shared timm backbone | bidirectional cross-attention tokens -> per-view bilinear descriptors |
 
 ### Options
 
 | Option | Default | Scope | Description |
 |---|---:|---|---|
-| `--model` | required | selection | `simple_cnn`, `shared_bilinear`, `multiview_bilinear`, `all` |
+| `--model` | required | selection | `simple_cnn`, `shared_bilinear`, `multiview_bilinear`, `cross_attention_bilinear`, `all` |
 | `--backbone-name` | `efficientnetv2_rw_s` | all | timm backbone |
 | `--pretrained` | `true` | all | `true`/`false`; timm pretrained weights |
 | `--feature-dim` | `128` | all | projected feature channels |
 | `--share-backbone-weights` | `true` | `multiview_bilinear` | `true`/`false`; view 간 backbone 공유 |
+| `--attention-heads` | `8` | `cross_attention_bilinear` | cross-attention heads |
+| `--attention-layers` | `2` | `cross_attention_bilinear` | bidirectional attention blocks |
+| `--attention-dropout` | `0.1` | `cross_attention_bilinear` | attention dropout |
+| `--attention-pos-grid` | `7` | `cross_attention_bilinear` | learnable positional grid size |
 | `--image-size` | `224` | all | input resize size |
 | `--connectors` | `all` | dataset | `all`, `SFP`, `SC` 중 하나 |
 
@@ -97,13 +102,18 @@ checkpoints/
       loss_curve.png
     shared_bilinear/
     multiview_bilinear/
+    cross_attention_bilinear/
   SC/
     simple_cnn/
     shared_bilinear/
     multiview_bilinear/
+    cross_attention_bilinear/
   model_comparison.csv
   model_comparison.json
+  model_training_curves.png
 ```
+
+단일 실행도 같은 구조를 사용합니다. 예: `--connectors SFP --model simple_cnn` -> `checkpoints/SFP/simple_cnn/`.
 
 ### Single Runs
 
@@ -156,7 +166,8 @@ python3 train.py \
 | File | Content |
 |---|---|
 | `model_comparison.csv` | connector/model별 MAE와 선택 점수 |
-| `model_comparison.json` | sorted summary |
+| `model_comparison.json` | sorted summary와 artifact path |
+| `model_training_curves.png` | root-level model train/val curve overview |
 | `loss_history.csv` | epoch별 total/xyz/rpy train-val loss |
 | `loss_curve.png` | total/xyz/rpy train-val loss curves |
 | model `README.md` | connector, model config, best validation metrics |
@@ -180,7 +191,7 @@ python3 train.py \
 | Option | Default | Effect |
 |---|---:|---|
 | `--hub-repo-id` | `aic-sejong-team/aic-vision-offset-models` | upload target |
-| `--hub-revision` | repo default | 보통 `main` branch에 새 commit |
+| `--hub-revision` | repo default | 지정하면 해당 branch를 만들고 업로드 |
 | `--hub-path-in-repo` | `.` | repo root에 `--output-dir` 전체 업로드 |
 | `--hub-private` | `False` | repo private 생성/유지 |
 
