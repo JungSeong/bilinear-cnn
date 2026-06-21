@@ -91,6 +91,19 @@ checkpoints/
   model_comparison.json
 ```
 
+EarlyStopping은 기본으로 켜져 있습니다. validation loss가 `--early-stopping-patience`
+epoch 동안 개선되지 않으면 해당 모델 학습을 중단합니다.
+
+```bash
+python3 train.py \
+  --model all \
+  --early-stopping-patience 20 \
+  --early-stopping-min-delta 0.0 \
+  --output-dir checkpoints
+```
+
+EarlyStopping을 끄려면 patience를 `0`으로 둡니다.
+
 이미 학습된 모델을 건너뛰고 비교표만 다시 만들고 싶다면 `--skip-existing`을 추가합니다.
 
 `model_comparison.csv`에는 축별 MAE와 함께 최종 선택용 컬럼이 같이 저장됩니다.

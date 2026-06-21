@@ -275,6 +275,9 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
     best_metrics = {}
+    best_epoch = 0
+    stopped_epoch = None
+    epochs_without_improvement = 0
     best_checkpoint_path = output_dir / f"{model_name}_best.pt"
     summary_path = output_dir / "training_summary.json"
 
@@ -300,9 +303,11 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
         train_loss = running_loss / max(1, running_count)
         metrics = evaluate(model, val_loader, device)
         scheduler.step(metrics["loss"])
-        is_best = metrics["loss"] < best_loss
+        is_best = metrics["loss"] < (best_loss - args.early_stopping_min_delta)
         if is_best:
             best_loss = metrics["loss"]
+            best_epoch = epoch
+            epochs_without_improvement = 0
             torch.save(
                 {
                     "model": model.state_dict(),
@@ -317,13 +322,26 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
                 best_checkpoint_path,
             )
             best_metrics = metrics
+        else:
+            epochs_without_improvement += 1
         print(
             f"epoch={epoch:03d} train_loss={train_loss:.6f} "
             f"val_loss={metrics['loss']:.6f} "
             f"xyz_mae_mm={metrics['xyz_mae_mm']} "
             f"rpy_mae_deg={metrics['rpy_mae_deg']} "
+            f"no_improve={epochs_without_improvement}/{args.early_stopping_patience} "
             f"{'*' if is_best else ''}"
         )
+        if (
+            args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            stopped_epoch = epoch
+            print(
+                f"Early stopping {model_name} at epoch {epoch}. "
+                f"best_epoch={best_epoch}, best_loss={best_loss:.6f}"
+            )
+            break
 
     summary = {
         "model": model_name,
@@ -337,6 +355,10 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
         "dataset_hf_revision": args.dataset_hf_revision,
         "connectors": args.connectors,
         "seed": args.seed,
+        "best_epoch": best_epoch,
+        "stopped_epoch": stopped_epoch,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
         "best_loss": best_loss,
         "best_metrics": best_metrics,
         "rpy_score_weight": args.rpy_score_weight,
@@ -377,7 +399,9 @@ def parse_args():
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--feature-dim", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--early-stopping-patience", type=int, default=20)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--rpy-score-weight", type=float, default=1.0)
