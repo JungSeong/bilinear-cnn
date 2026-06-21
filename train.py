@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -10,7 +11,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from dataset import AICVisionOffsetMultiView
+from dataset import AICVisionOffsetMultiView, DEFAULT_CONNECTORS
 from models import build_model
 from reproducibility import make_generator, seed_everything, seed_worker
 
@@ -28,13 +29,44 @@ def make_transform(image_size: int, train: bool):
     return transforms.Compose(steps)
 
 
-def make_dataset(args, split: str):
-    transform = make_transform(args.image_size, train=(split == "train"))
+def connector_names_from_args(args) -> list[str]:
     connectors = tuple(item.strip().upper() for item in args.connectors.split(",") if item.strip())
+    allowed = ", ".join(("all", *DEFAULT_CONNECTORS))
+    if len(connectors) != 1:
+        raise ValueError(f"--connectors must be exactly one of: {allowed}")
+
+    connector = connectors[0]
+    if connector == "ALL":
+        return list(DEFAULT_CONNECTORS)
+
+    if connector not in DEFAULT_CONNECTORS:
+        raise ValueError(f"Unknown connector: {connector}. Use one of: {allowed}")
+    return [connector]
+
+
+def parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value: true/false")
+
+
+def make_dataset(args, split: str, connector: str):
+    transform = make_transform(args.image_size, train=(split == "train"))
+    print(
+        "[Dataset] Loading "
+        f"split={split}, root={Path(args.dataset_root).expanduser()}, "
+        f"connector={connector}"
+    )
     return AICVisionOffsetMultiView(
         args.dataset_root,
         split=split,
-        connectors=connectors,
+        connectors=(connector,),
         transform=transform,
         require_all_views=True,
         hf_repo_id=args.dataset_hf_repo_id,
@@ -47,24 +79,88 @@ def to_device(batch, device):
     return images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
 
-def evaluate(model, loader, device):
+class SeparateXYZRPYSmoothL1Loss(nn.Module):
+    def __init__(
+        self,
+        *,
+        xyz_scale_mm: float,
+        rpy_scale_deg: float,
+        xyz_weight: float,
+        rpy_weight: float,
+    ) -> None:
+        super().__init__()
+        if xyz_scale_mm <= 0.0:
+            raise ValueError("--xyz-loss-scale-mm must be greater than 0")
+        if rpy_scale_deg <= 0.0:
+            raise ValueError("--rpy-loss-scale-deg must be greater than 0")
+        if xyz_weight <= 0.0:
+            raise ValueError("--xyz-loss-weight must be greater than 0")
+        if rpy_weight <= 0.0:
+            raise ValueError("--rpy-loss-weight must be greater than 0")
+
+        xyz_scale_m = xyz_scale_mm / 1000.0
+        rpy_scale_rad = math.radians(rpy_scale_deg)
+        self.register_buffer(
+            "xyz_scale",
+            torch.tensor(xyz_scale_m, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "rpy_scale",
+            torch.tensor(rpy_scale_rad, dtype=torch.float32),
+        )
+        self.xyz_weight = xyz_weight
+        self.rpy_weight = rpy_weight
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        xyz_error = (pred[:, :3] - target[:, :3]) / self.xyz_scale
+        rpy_error = (pred[:, 3:] - target[:, 3:]) / self.rpy_scale
+        xyz_loss = nn.functional.smooth_l1_loss(
+            xyz_error,
+            torch.zeros_like(xyz_error),
+        )
+        rpy_loss = nn.functional.smooth_l1_loss(
+            rpy_error,
+            torch.zeros_like(rpy_error),
+        )
+        total_loss = self.xyz_weight * xyz_loss + self.rpy_weight * rpy_loss
+        return total_loss, {
+            "xyz_loss": xyz_loss.detach(),
+            "rpy_loss": rpy_loss.detach(),
+        }
+
+
+def make_loss_fn(args, device):
+    return SeparateXYZRPYSmoothL1Loss(
+        xyz_scale_mm=args.xyz_loss_scale_mm,
+        rpy_scale_deg=args.rpy_loss_scale_deg,
+        xyz_weight=args.xyz_loss_weight,
+        rpy_weight=args.rpy_loss_weight,
+    ).to(device)
+
+
+def evaluate(model, loader, device, loss_fn):
     model.eval()
-    loss_fn = nn.SmoothL1Loss()
     total_loss = 0.0
+    total_xyz_loss = 0.0
+    total_rpy_loss = 0.0
     total_count = 0
     abs_error_sum = torch.zeros(6, device=device)
     with torch.no_grad():
         for batch in loader:
             images, labels = to_device(batch, device)
             pred = model(images)
-            loss = loss_fn(pred, labels)
+            loss, loss_parts = loss_fn(pred, labels)
             count = labels.size(0)
             total_loss += float(loss.item()) * count
+            total_xyz_loss += float(loss_parts["xyz_loss"].item()) * count
+            total_rpy_loss += float(loss_parts["rpy_loss"].item()) * count
             total_count += count
             abs_error_sum += torch.abs(pred - labels).sum(dim=0)
     mae = abs_error_sum / max(1, total_count)
     return {
         "loss": total_loss / max(1, total_count),
+        "xyz_loss": total_xyz_loss / max(1, total_count),
+        "rpy_loss": total_rpy_loss / max(1, total_count),
         "xyz_mae_mm": (mae[:3] * 1000.0).detach().cpu().tolist(),
         "rpy_mae_deg": torch.rad2deg(mae[3:]).detach().cpu().tolist(),
     }
@@ -79,19 +175,18 @@ def model_names_from_args(args) -> list[str]:
     return [args.model]
 
 
-def write_model_card(args, model_name: str, output_dir: Path, best_loss: float, best_metrics: dict) -> None:
+def write_model_card(
+    args,
+    model_name: str,
+    connector: str,
+    output_dir: Path,
+    best_loss: float,
+    best_metrics: dict,
+) -> None:
     card_path = output_dir / "README.md"
     card_path.write_text(
         "\n".join(
             [
-                "---",
-                "library_name: pytorch",
-                "tags:",
-                "- computer-vision",
-                "- robotics",
-                "- regression",
-                "- aic-sejong",
-                "---",
                 "",
                 "# AIC Vision Offset Regression Model",
                 "",
@@ -104,13 +199,19 @@ def write_model_card(args, model_name: str, output_dir: Path, best_loss: float, 
                 "## Training Configuration",
                 "",
                 f"- model: `{model_name}`",
+                f"- connector: `{connector}`",
                 f"- backbone: `{args.backbone_name}`",
                 f"- pretrained backbone: `{args.pretrained}`",
                 f"- feature_dim: `{args.feature_dim}`",
                 f"- image_size: `{args.image_size}`",
-                f"- connectors: `{args.connectors}`",
+                f"- share backbone weights (multiview only): `{args.share_backbone_weights}`",
+                f"- requested connectors: `{args.connectors}`",
                 f"- dataset repo: `{args.dataset_hf_repo_id}`",
                 f"- dataset revision: `{args.dataset_hf_revision}`",
+                f"- xyz loss scale mm: `{args.xyz_loss_scale_mm}`",
+                f"- rpy loss scale deg: `{args.rpy_loss_scale_deg}`",
+                f"- xyz loss weight: `{args.xyz_loss_weight}`",
+                f"- rpy loss weight: `{args.rpy_loss_weight}`",
                 f"- seed: `{args.seed}`",
                 "",
                 "## Best Validation Metrics",
@@ -119,10 +220,67 @@ def write_model_card(args, model_name: str, output_dir: Path, best_loss: float, 
                 f"- xyz MAE mm: `{best_metrics.get('xyz_mae_mm', [])}`",
                 f"- rpy MAE deg: `{best_metrics.get('rpy_mae_deg', [])}`",
                 "",
+                "## Artifacts",
+                "",
+                f"- best checkpoint: `{model_name}_best.pt`",
+                "- training summary: `training_summary.json`",
+                "- loss history: `loss_history.csv`",
+                "- loss curve: `loss_curve.png`",
+                "",
             ]
         ),
         encoding="utf-8",
     )
+
+
+def write_loss_artifacts(output_dir: Path, model_name: str, history: list[dict]) -> tuple[Path, Path]:
+    history_path = output_dir / "loss_history.csv"
+    curve_path = output_dir / "loss_curve.png"
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "train_xyz_loss",
+        "train_rpy_loss",
+        "val_loss",
+        "val_xyz_loss",
+        "val_rpy_loss",
+    ]
+
+    with history_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(history)
+
+    if not history:
+        return history_path, curve_path
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs = [row["epoch"] for row in history]
+    plots = [
+        ("total loss", "train_loss", "val_loss"),
+        ("xyz loss", "train_xyz_loss", "val_xyz_loss"),
+        ("rpy loss", "train_rpy_loss", "val_rpy_loss"),
+    ]
+
+    fig, axes = plt.subplots(len(plots), 1, figsize=(8, 9), sharex=True)
+    fig.suptitle(f"{model_name} train/val loss")
+    for ax, (title, train_key, val_key) in zip(axes, plots):
+        ax.plot(epochs, [row[train_key] for row in history], marker="o", linewidth=1.8, label="train")
+        ax.plot(epochs, [row[val_key] for row in history], marker="o", linewidth=1.8, label="val")
+        ax.set_title(title)
+        ax.set_ylabel("SmoothL1")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+    axes[-1].set_xlabel("epoch")
+    fig.tight_layout()
+    fig.savefig(curve_path, dpi=150)
+    plt.close(fig)
+
+    return history_path, curve_path
 
 
 def push_output_to_hub(args, output_dir: Path) -> None:
@@ -171,6 +329,7 @@ def flatten_summary_for_csv(summary: dict) -> dict:
     if mean_xyz_mae_mm is not None and mean_rpy_mae_deg is not None:
         selection_score = mean_xyz_mae_mm + rpy_score_weight * mean_rpy_mae_deg
     return {
+        "connector": summary.get("connector"),
         "model": summary.get("model"),
         "selection_score": selection_score,
         "mean_xyz_mae_mm": mean_xyz_mae_mm,
@@ -200,7 +359,11 @@ def write_comparison_files(output_dir: Path, summaries: list[dict]) -> None:
     )
     sorted_summaries = []
     for row in rows:
-        summary = next(summary for summary in summaries if summary.get("model") == row["model"])
+        summary = next(
+            summary
+            for summary in summaries
+            if summary.get("connector") == row["connector"] and summary.get("model") == row["model"]
+        )
         summary = dict(summary)
         summary["selection_score"] = row["selection_score"]
         summary["mean_xyz_mae_mm"] = row["mean_xyz_mae_mm"]
@@ -222,7 +385,7 @@ def write_comparison_files(output_dir: Path, summaries: list[dict]) -> None:
         score_text = f"{float(row['selection_score']):.6f}" if row["selection_score"] is not None else "nan"
         loss_text = f"{float(row['best_loss']):.6f}" if row["best_loss"] is not None else "nan"
         print(
-            f"{row['model']}: score={score_text}, "
+            f"{row['connector']}/{row['model']}: score={score_text}, "
             f"mean_xyz_mae_mm={row['mean_xyz_mae_mm']}, "
             f"mean_rpy_mae_deg={row['mean_rpy_mae_deg']}, "
             f"loss={loss_text}, "
@@ -232,13 +395,13 @@ def write_comparison_files(output_dir: Path, summaries: list[dict]) -> None:
     print(f"Saved comparison: {csv_path}")
 
 
-def train_one_model(args, model_name: str, output_dir: Path) -> dict:
+def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> dict:
     seed_everything(args.seed, deterministic=args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     generator = make_generator(args.seed)
 
-    train_data = make_dataset(args, "train")
-    val_data = make_dataset(args, "val")
+    train_data = make_dataset(args, "train", connector)
+    val_data = make_dataset(args, "val", connector)
     train_loader = DataLoader(
         train_data,
         batch_size=args.batch_size,
@@ -263,6 +426,7 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
         feature_dim=args.feature_dim,
         backbone_name=args.backbone_name,
         pretrained=args.pretrained,
+        share_backbone_weights=args.share_backbone_weights,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -271,13 +435,14 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
         factor=0.5,
         patience=3,
     )
-    loss_fn = nn.SmoothL1Loss()
+    loss_fn = make_loss_fn(args, device)
     output_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
     best_metrics = {}
     best_epoch = 0
     stopped_epoch = None
     epochs_without_improvement = 0
+    history = []
     best_checkpoint_path = output_dir / f"{model_name}_best.pt"
     summary_path = output_dir / "training_summary.json"
 
@@ -288,20 +453,37 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
+        running_xyz_loss = 0.0
+        running_rpy_loss = 0.0
         running_count = 0
         for batch in train_loader:
             images, labels = to_device(batch, device)
             pred = model(images)
-            loss = loss_fn(pred, labels)
+            loss, loss_parts = loss_fn(pred, labels)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             count = labels.size(0)
             running_loss += float(loss.item()) * count
+            running_xyz_loss += float(loss_parts["xyz_loss"].item()) * count
+            running_rpy_loss += float(loss_parts["rpy_loss"].item()) * count
             running_count += count
 
         train_loss = running_loss / max(1, running_count)
-        metrics = evaluate(model, val_loader, device)
+        train_xyz_loss = running_xyz_loss / max(1, running_count)
+        train_rpy_loss = running_rpy_loss / max(1, running_count)
+        metrics = evaluate(model, val_loader, device, loss_fn)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_xyz_loss": train_xyz_loss,
+                "train_rpy_loss": train_rpy_loss,
+                "val_loss": metrics["loss"],
+                "val_xyz_loss": metrics["xyz_loss"],
+                "val_rpy_loss": metrics["rpy_loss"],
+            }
+        )
         scheduler.step(metrics["loss"])
         is_best = metrics["loss"] < (best_loss - args.early_stopping_min_delta)
         if is_best:
@@ -312,10 +494,16 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
                 {
                     "model": model.state_dict(),
                     "model_name": model_name,
+                    "connector": connector,
                     "backbone_name": args.backbone_name,
                     "pretrained": args.pretrained,
                     "feature_dim": args.feature_dim,
                     "image_size": args.image_size,
+                    "share_backbone_weights": args.share_backbone_weights,
+                    "xyz_loss_scale_mm": args.xyz_loss_scale_mm,
+                    "rpy_loss_scale_deg": args.rpy_loss_scale_deg,
+                    "xyz_loss_weight": args.xyz_loss_weight,
+                    "rpy_loss_weight": args.rpy_loss_weight,
                     "label_order": ["x_m", "y_m", "z_m", "roll_rad", "pitch_rad", "yaw_rad"],
                     "dataset_root": str(Path(args.dataset_root).expanduser()),
                 },
@@ -326,7 +514,11 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
             epochs_without_improvement += 1
         print(
             f"epoch={epoch:03d} train_loss={train_loss:.6f} "
+            f"train_xyz_loss={train_xyz_loss:.6f} "
+            f"train_rpy_loss={train_rpy_loss:.6f} "
             f"val_loss={metrics['loss']:.6f} "
+            f"val_xyz_loss={metrics['xyz_loss']:.6f} "
+            f"val_rpy_loss={metrics['rpy_loss']:.6f} "
             f"xyz_mae_mm={metrics['xyz_mae_mm']} "
             f"rpy_mae_deg={metrics['rpy_mae_deg']} "
             f"no_improve={epochs_without_improvement}/{args.early_stopping_patience} "
@@ -343,17 +535,24 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
             )
             break
 
+    loss_history_path, loss_curve_path = write_loss_artifacts(output_dir, model_name, history)
     summary = {
         "model": model_name,
+        "connector": connector,
         "backbone_name": args.backbone_name,
         "pretrained": args.pretrained,
         "feature_dim": args.feature_dim,
         "image_size": args.image_size,
+        "share_backbone_weights": args.share_backbone_weights,
+        "xyz_loss_scale_mm": args.xyz_loss_scale_mm,
+        "rpy_loss_scale_deg": args.rpy_loss_scale_deg,
+        "xyz_loss_weight": args.xyz_loss_weight,
+        "rpy_loss_weight": args.rpy_loss_weight,
         "label_order": ["x_m", "y_m", "z_m", "roll_rad", "pitch_rad", "yaw_rad"],
         "dataset_root": str(Path(args.dataset_root).expanduser()),
         "dataset_hf_repo_id": args.dataset_hf_repo_id,
         "dataset_hf_revision": args.dataset_hf_revision,
-        "connectors": args.connectors,
+        "requested_connectors": args.connectors,
         "seed": args.seed,
         "best_epoch": best_epoch,
         "stopped_epoch": stopped_epoch,
@@ -363,24 +562,33 @@ def train_one_model(args, model_name: str, output_dir: Path) -> dict:
         "best_metrics": best_metrics,
         "rpy_score_weight": args.rpy_score_weight,
         "best_checkpoint": str(best_checkpoint_path),
+        "loss_history": str(loss_history_path),
+        "loss_curve": str(loss_curve_path),
+        "history": history,
     }
     summary_path.write_text(
         json.dumps(summary, indent=2),
         encoding="utf-8",
     )
-    write_model_card(args, model_name, output_dir, best_loss, best_metrics)
+    write_model_card(args, model_name, connector, output_dir, best_loss, best_metrics)
     return summary
 
 
 def train(args):
     root_output_dir = Path(args.output_dir).expanduser()
     selected_models = model_names_from_args(args)
+    selected_connectors = connector_names_from_args(args)
     summaries = []
 
-    for model_name in selected_models:
-        model_output_dir = root_output_dir / model_name if len(selected_models) > 1 else root_output_dir
-        print(f"\n=== Training {model_name} ===")
-        summaries.append(train_one_model(args, model_name, model_output_dir))
+    for connector in selected_connectors:
+        for model_name in selected_models:
+            model_output_dir = root_output_dir
+            if len(selected_connectors) > 1:
+                model_output_dir = model_output_dir / connector
+            if len(selected_models) > 1:
+                model_output_dir = model_output_dir / model_name
+            print(f"\n=== Training {connector}/{model_name} ===")
+            summaries.append(train_one_model(args, model_name, connector, model_output_dir))
 
     write_comparison_files(root_output_dir, summaries)
     push_output_to_hub(args, root_output_dir)
@@ -393,17 +601,41 @@ def parse_args():
     parser.add_argument("--dataset-hf-revision", default=None)
     parser.add_argument("--output-dir", default="./checkpoints")
     parser.add_argument("--model", choices=["simple_cnn", "shared_bilinear", "multiview_bilinear", "all"], required=True)
-    parser.add_argument("--connectors", default="SFP,SC")
+    parser.add_argument(
+        "--connectors",
+        default="all",
+        metavar="{all|SFP|SC}",
+        help="connector selection; all trains SFP and SC as separate jobs",
+    )
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--backbone-name", default="efficientnetv2_rw_s")
-    parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--pretrained",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        metavar="{true|false}",
+    )
     parser.add_argument("--feature-dim", type=int, default=128)
+    parser.add_argument(
+        "--share-backbone-weights",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        metavar="{true|false}",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--early-stopping-patience", type=int, default=20)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--xyz-loss-scale-mm", type=float, default=10.0)
+    parser.add_argument("--rpy-loss-scale-deg", type=float, default=1.0)
+    parser.add_argument("--xyz-loss-weight", type=float, default=2.0)
+    parser.add_argument("--rpy-loss-weight", type=float, default=1.0)
     parser.add_argument("--rpy-score-weight", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)

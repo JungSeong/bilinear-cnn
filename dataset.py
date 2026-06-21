@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 
 
 CAMERAS = ("left", "center", "right")
+DEFAULT_CONNECTORS = ("SFP", "SC")
 LABEL_KEYS = ("x_m", "y_m", "z_m", "roll_rad", "pitch_rad", "yaw_rad")
 DEFAULT_HF_DATASET_REPO_ID = "aic-sejong-team/aic-vision-offset-dataset"
 
@@ -33,32 +34,46 @@ def _has_requested_metadata(
     return True
 
 
-def ensure_dataset_available(
-    root: str | Path,
-    split: str,
+def _download_command(
+    root: Path,
     connectors: tuple[str, ...],
-    cameras: tuple[str, ...],
+    hf_repo_id: str,
+    hf_revision: str | None,
+) -> str:
+    connector_arg = "all" if connectors == DEFAULT_CONNECTORS else ",".join(connectors)
+    command = [
+        "python3 download_dataset.py",
+        f"--dataset-root {root}",
+        f"--dataset-hf-repo-id {hf_repo_id}",
+        f"--connectors {connector_arg}",
+    ]
+    if hf_revision:
+        command.append(f"--dataset-hf-revision {hf_revision}")
+    return " ".join(command)
+
+
+def download_dataset(
+    root: str | Path,
     hf_repo_id: str = DEFAULT_HF_DATASET_REPO_ID,
     hf_revision: str | None = None,
 ) -> Path:
-    """Use local dataset if valid; otherwise download it from Hugging Face."""
+    """Download the dataset snapshot from Hugging Face into root."""
     dataset_root = Path(root).expanduser()
-    if _has_requested_metadata(dataset_root, split, connectors, cameras):
-        return dataset_root
 
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise ImportError(
-            "Local vision-offset dataset was not found and huggingface_hub is "
-            "not installed. Install requirements.txt or provide --dataset-root "
-            "with an existing dataset."
+            "huggingface_hub is required to download the dataset. "
+            "Install requirements.txt first."
         ) from exc
 
     dataset_root.mkdir(parents=True, exist_ok=True)
     print(
-        "Local vision-offset dataset is missing or incomplete; "
-        f"downloading {hf_repo_id} to {dataset_root}"
+        "[Dataset] Downloading "
+        f"{hf_repo_id}"
+        f"{'@' + hf_revision if hf_revision else ''} "
+        f"to {dataset_root}"
     )
     snapshot_download(
         repo_id=hf_repo_id,
@@ -66,7 +81,36 @@ def ensure_dataset_available(
         revision=hf_revision,
         local_dir=str(dataset_root),
     )
+    print(f"[Dataset] Download complete: {dataset_root}")
     return dataset_root
+
+
+def require_dataset_available(
+    root: str | Path,
+    split: str,
+    connectors: tuple[str, ...],
+    cameras: tuple[str, ...],
+    hf_repo_id: str = DEFAULT_HF_DATASET_REPO_ID,
+    hf_revision: str | None = None,
+) -> Path:
+    """Return the local dataset root, or fail with a download-first message."""
+    dataset_root = Path(root).expanduser()
+    if _has_requested_metadata(dataset_root, split, connectors, cameras):
+        return dataset_root
+
+    expected = dataset_root / "metadata" / split
+    command = _download_command(dataset_root, connectors, hf_repo_id, hf_revision)
+    print(
+        "[Dataset] Local vision-offset dataset is missing or incomplete.\n"
+        f"[Dataset] Missing split/connectors under: {expected}\n"
+        "[Dataset] Training does not download datasets automatically. "
+        "Download it first with:\n"
+        f"[Dataset]   {command}"
+    )
+    raise FileNotFoundError(
+        "Vision-offset dataset is missing or incomplete. "
+        f"Run `{command}` before training."
+    )
 
 
 def _read_json(path: Path) -> dict:
@@ -91,14 +135,14 @@ class AICVisionOffsetMultiView(Dataset):
         self,
         root: str | Path,
         split: Literal["train", "val"] = "train",
-        connectors: tuple[str, ...] = ("SFP", "SC"),
+        connectors: tuple[str, ...] = DEFAULT_CONNECTORS,
         cameras: tuple[str, ...] = CAMERAS,
         transform=None,
         require_all_views: bool = True,
         hf_repo_id: str = DEFAULT_HF_DATASET_REPO_ID,
         hf_revision: str | None = None,
     ) -> None:
-        self.root = ensure_dataset_available(
+        self.root = require_dataset_available(
             root,
             split=split,
             connectors=connectors,

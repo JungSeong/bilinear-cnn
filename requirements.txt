@@ -4,3 +4,4 @@ timm
 numpy
 pillow
 huggingface_hub
+matplotlib

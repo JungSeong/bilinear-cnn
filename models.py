@@ -282,6 +282,7 @@ def build_model(
     feature_dim: int = 128,
     backbone_name: str = "efficientnetv2_rw_s",
     pretrained: bool = True,
+    share_backbone_weights: bool = True,
 ) -> nn.Module:
     name = name.strip().lower()
     if name in {"simple", "simple_cnn"}:
@@ -301,6 +302,7 @@ def build_model(
             feature_dim=feature_dim,
             backbone_name=backbone_name,
             pretrained=pretrained,
+            share_backbone_weights=share_backbone_weights,
         )
     raise ValueError(
         "Unknown model name. Use one of: simple_cnn, shared_bilinear, "
