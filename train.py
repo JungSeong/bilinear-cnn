@@ -166,6 +166,48 @@ def evaluate(model, loader, device, loss_fn):
     }
 
 
+def format_axis_metrics(values: list[float], names: tuple[str, ...]) -> str:
+    values = [float(value) for value in values]
+    if not values:
+        return "n/a"
+
+    parts = [f"{name}={value:.2f}" for name, value in zip(names, values)]
+    parts.append(f"mean={sum(values) / len(values):.2f}")
+    return " ".join(parts)
+
+
+def format_epoch_log(
+    *,
+    epoch: int,
+    max_epochs: int,
+    train_loss: float,
+    train_xyz_loss: float,
+    train_rpy_loss: float,
+    metrics: dict,
+    epochs_without_improvement: int,
+    early_stopping_patience: int,
+    is_best: bool,
+) -> str:
+    marker = " best" if is_best else ""
+    early_stop_text = (
+        "off"
+        if early_stopping_patience <= 0
+        else f"{epochs_without_improvement}/{early_stopping_patience}"
+    )
+    return "\n".join(
+        [
+            f"[Epoch {epoch:03d}/{max_epochs:03d}]{marker}",
+            "  loss    "
+            f"train total={train_loss:.4f} xyz={train_xyz_loss:.4f} rpy={train_rpy_loss:.4f} | "
+            f"val total={metrics['loss']:.4f} xyz={metrics['xyz_loss']:.4f} rpy={metrics['rpy_loss']:.4f}",
+            "  val mae "
+            f"xyz_mm {format_axis_metrics(metrics['xyz_mae_mm'], ('x', 'y', 'z'))} | "
+            f"rpy_deg {format_axis_metrics(metrics['rpy_mae_deg'], ('roll', 'pitch', 'yaw'))} | "
+            f"early_stop {early_stop_text}",
+        ]
+    )
+
+
 MODEL_NAMES = ("simple_cnn", "shared_bilinear", "multiview_bilinear")
 
 
@@ -513,16 +555,17 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
         else:
             epochs_without_improvement += 1
         print(
-            f"epoch={epoch:03d} train_loss={train_loss:.6f} "
-            f"train_xyz_loss={train_xyz_loss:.6f} "
-            f"train_rpy_loss={train_rpy_loss:.6f} "
-            f"val_loss={metrics['loss']:.6f} "
-            f"val_xyz_loss={metrics['xyz_loss']:.6f} "
-            f"val_rpy_loss={metrics['rpy_loss']:.6f} "
-            f"xyz_mae_mm={metrics['xyz_mae_mm']} "
-            f"rpy_mae_deg={metrics['rpy_mae_deg']} "
-            f"no_improve={epochs_without_improvement}/{args.early_stopping_patience} "
-            f"{'*' if is_best else ''}"
+            format_epoch_log(
+                epoch=epoch,
+                max_epochs=args.epochs,
+                train_loss=train_loss,
+                train_xyz_loss=train_xyz_loss,
+                train_rpy_loss=train_rpy_loss,
+                metrics=metrics,
+                epochs_without_improvement=epochs_without_improvement,
+                early_stopping_patience=args.early_stopping_patience,
+                is_best=is_best,
+            )
         )
         if (
             args.early_stopping_patience > 0
