@@ -1,49 +1,14 @@
 # AIC Bilinear CNN
 
-AIC_Sejong 프로젝트에서 데이터 생성 노드로 생성한 `vision_offset_dataset`으로 FinalPolicy ALIGN 단계에서 사용할 6D correction 모델을 학습하는 실험 코드
+AI for Industry Challenge의 FinalPolicy 노드의 ALIGN 단계에서 사용할 6D correction 모델을 학습하는 실험 코드
 
 ## Dataset
 
-기본 입력 데이터셋:
-
-```text
-/home/swlinux/Desktop/workspace/AIC_Sejong/data/vision_offset_dataset
-```
-
-현재 loader는 다음 구조를 읽습니다.
-
-```text
-images/<split>/<connector>/<camera>/*.jpg
-metadata/<split>/<connector>/<camera>/*.json
-```
-
-로더는 먼저 `--dataset-root`의 로컬 데이터셋을 검증합니다. 요청한
-`split/connectors/cameras`에 대한 metadata가 없으면 HuggingFace dataset repo에서
-같은 위치로 내려받습니다.
-
-```text
-aic-sejong-team/aic-vision-offset-dataset
-```
-
-다른 repo나 revision을 쓰려면 학습 시 다음 옵션을 바꿉니다.
-
-```bash
-python3 train.py \
-  --model simple_cnn \
-  --dataset-hf-repo-id aic-sejong-team/aic-vision-offset-dataset \
-  --dataset-hf-revision main
-```
-
-private repo라면 먼저 `hf auth login`이 필요합니다. `HF_TOKEN` 환경변수가 설정되어 있으면
-CLI 로그인보다 우선 적용됩니다.
-
-label 순서는 모든 모델에서 동일합니다.
+label은 아래와 같으며, `base_link` 좌표계 기준으로 포트에 정렬되기 위한 offset을 의미합니다.
 
 ```python
 [x_m, y_m, z_m, roll_rad, pitch_rad, yaw_rad]
 ```
-
-이 값은 `base_link` 기준 correction입니다.
 
 ## Models
 
@@ -53,24 +18,34 @@ label 순서는 모든 모델에서 동일합니다.
 | `shared_bilinear` | `SharedBilinearCNNRegressor` | left/center/right group | shared timm backbone, mean feature, one bilinear outer product | 6D correction |
 | `multiview_bilinear` | `MultiViewBilinearCNNRegressor` | left/center/right group | view-specific timm backbones, bilinear outer product per view, concat | 6D correction |
 
-## Requirements
+## 시작하기
 
+### 1. 가상환경 설정
 ```bash
-pip install -r /home/swlinux/Desktop/cool-library/bilinear-cnn/ais_bilinear-cnn/requirements.txt
+git clone https://github.com/whyz-dev/structure-stability.git
+cd bilinear-cnn
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-`--pretrained`가 기본값이라 첫 실행 시 timm 백본 weight 다운로드가 필요할 수 있습니다.
-네트워크 없이 구조만 검증하거나 완전 scratch timm 백본으로 학습하려면 `--no-pretrained`를 붙입니다.
+### 2. HuggingFace 토큰 설정
+```bash
+hf auth login
+hf auth whoami
+```
 
-## Train
+### 3. Train
+`--pretrained`가 기본값이며, 첫 실행 시 timm 백본 weight 다운로드가 필요할 수 있습니다.
+완전 scratch timm 백본으로 학습하려면 `--no-pretrained`를 붙입니다.
 
 ```bash
-cd /home/swlinux/Desktop/cool-library/bilinear-cnn/ais_bilinear-cnn
+cd bilinear-cnn
 
 python3 train.py \
   --model all \
   --backbone-name efficientnetv2_rw_s \
-  --dataset-root /home/swlinux/Desktop/workspace/AIC_Sejong/data/vision_offset_dataset \
+  --dataset-root data/vision_offset_dataset \
   --output-dir checkpoints
 ```
 
@@ -128,23 +103,41 @@ python3 train.py \
 python3 train.py \
   --model simple_cnn \
   --backbone-name efficientnetv2_rw_s \
-  --dataset-root /home/swlinux/Desktop/workspace/AIC_Sejong/data/vision_offset_dataset \
+  --dataset-root data/vision_offset_dataset \
   --output-dir checkpoints
 
 python3 train.py \
   --model shared_bilinear \
   --backbone-name efficientnetv2_rw_s \
-  --dataset-root /home/swlinux/Desktop/workspace/AIC_Sejong/data/vision_offset_dataset \
+  --dataset-root data/vision_offset_dataset \
   --output-dir checkpoints
 
 python3 train.py \
   --model multiview_bilinear \
   --backbone-name efficientnetv2_rw_s \
-  --dataset-root /home/swlinux/Desktop/workspace/AIC_Sejong/data/vision_offset_dataset \
+  --dataset-root data/vision_offset_dataset \
   --output-dir checkpoints
 ```
 
-## Kaggle
+### Upload Model To HuggingFace
+
+학습 종료 후 best checkpoint, `training_summary.json`, model card를 HuggingFace model repo로
+올리려면 `--push-to-hub`를 추가합니다.
+기본 업로드 대상 repo는 `aic-sejong-team/aic-vision-offset-models`입니다.
+
+```bash
+python train.py \
+  --model all \
+  --dataset-root /kaggle/working/vision_offset_dataset \
+  --output-dir /kaggle/working/aic_vision_offset_checkpoints \
+  --push-to-hub \
+  --hub-private
+```
+
+repo가 없으면 `create_repo(..., exist_ok=True)`로 생성합니다. private repo에 올리려면
+토큰에 write 권한이 있어야 합니다.
+
+### Kaggle
 
 Kaggle Notebook에서도 실행 가능합니다. 단, 기본 경로는 로컬 PC 기준이므로
 `--dataset-root`와 `--output-dir`는 Kaggle 경로로 지정하는 것을 권장합니다.
@@ -182,24 +175,6 @@ python train.py \
   --batch-size 8 \
   --epochs 50
 ```
-
-## Upload Model To HuggingFace
-
-학습 종료 후 best checkpoint, `training_summary.json`, model card를 HuggingFace model repo로
-올리려면 `--push-to-hub`를 추가합니다.
-기본 업로드 대상 repo는 `aic-sejong-team/aic-vision-offset-models`입니다.
-
-```bash
-python train.py \
-  --model all \
-  --dataset-root /kaggle/working/vision_offset_dataset \
-  --output-dir /kaggle/working/aic_vision_offset_checkpoints \
-  --push-to-hub \
-  --hub-private
-```
-
-repo가 없으면 `create_repo(..., exist_ok=True)`로 생성합니다. private repo에 올리려면
-토큰에 write 권한이 있어야 합니다.
 
 ## Diagrams
 
