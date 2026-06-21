@@ -363,9 +363,13 @@ def write_training_curves_overview(output_dir: Path, summaries: list[dict]) -> P
         ("mean xyz MAE", "train_mean_xyz_mae_mm", "val_mean_xyz_mae_mm", "mm"),
         ("mean rpy MAE", "train_mean_rpy_mae_deg", "val_mean_rpy_mae_deg", "deg"),
     ]
-    fig, axes = plt.subplots(len(plots), 1, figsize=(10, 11), sharex=True)
+    fig, axes = plt.subplots(len(plots), 2, figsize=(13, 11), sharex=True)
     fig.suptitle("Model train/val curves")
-    for ax, (title, train_key, val_key, ylabel) in zip(axes, plots):
+    legend_handles = []
+    legend_labels = []
+    for row_idx, (title, train_key, val_key, ylabel) in enumerate(plots):
+        train_ax = axes[row_idx][0]
+        val_ax = axes[row_idx][1]
         for summary in plot_summaries:
             history = summary["history"]
             epochs = [row["epoch"] for row in history]
@@ -374,26 +378,40 @@ def write_training_curves_overview(output_dir: Path, summaries: list[dict]) -> P
             if any(value is None for value in (*train_values, *val_values)):
                 continue
             label = f"{summary.get('connector')}/{summary.get('model')}"
-            ax.plot(
+            (train_line,) = train_ax.plot(
                 epochs,
                 train_values,
                 linewidth=1.5,
                 alpha=0.8,
-                label=f"{label} train",
+                label=label,
             )
-            ax.plot(
+            val_ax.plot(
                 epochs,
                 val_values,
                 linewidth=1.8,
-                linestyle="--",
-                label=f"{label} val",
+                alpha=0.8,
+                label=label,
             )
-        ax.set_title(title)
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
-    axes[-1].set_xlabel("epoch")
-    axes[0].legend(fontsize=7, ncol=2)
-    fig.tight_layout()
+            if label not in legend_labels:
+                legend_handles.append(train_line)
+                legend_labels.append(label)
+        train_ax.set_title(f"{title} - train")
+        val_ax.set_title(f"{title} - val")
+        train_ax.set_ylabel(ylabel)
+        val_ax.set_ylabel(ylabel)
+        train_ax.grid(True, alpha=0.3)
+        val_ax.grid(True, alpha=0.3)
+    axes[-1][0].set_xlabel("epoch")
+    axes[-1][1].set_xlabel("epoch")
+    if legend_handles:
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            fontsize=7,
+            ncol=min(4, max(1, len(legend_labels))),
+        )
+    fig.tight_layout(rect=(0, 0.05, 1, 0.97))
     fig.savefig(curve_path, dpi=150)
     plt.close(fig)
     return curve_path
