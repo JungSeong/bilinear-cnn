@@ -176,6 +176,11 @@ def format_axis_metrics(values: list[float], names: tuple[str, ...]) -> str:
     return " ".join(parts)
 
 
+def mean_metric(values: list[float]) -> float | None:
+    values = [float(value) for value in values]
+    return sum(values) / len(values) if values else None
+
+
 def format_epoch_log(
     *,
     epoch: int,
@@ -183,6 +188,7 @@ def format_epoch_log(
     train_loss: float,
     train_xyz_loss: float,
     train_rpy_loss: float,
+    train_metrics: dict,
     metrics: dict,
     epochs_without_improvement: int,
     early_stopping_patience: int,
@@ -200,7 +206,10 @@ def format_epoch_log(
             "  loss    "
             f"train total={train_loss:.4f} xyz={train_xyz_loss:.4f} rpy={train_rpy_loss:.4f} | "
             f"val total={metrics['loss']:.4f} xyz={metrics['xyz_loss']:.4f} rpy={metrics['rpy_loss']:.4f}",
-            "  val mae "
+            "  train mae "
+            f"xyz_mm {format_axis_metrics(train_metrics['xyz_mae_mm'], ('x', 'y', 'z'))} | "
+            f"rpy_deg {format_axis_metrics(train_metrics['rpy_mae_deg'], ('roll', 'pitch', 'yaw'))}",
+            "  val mae   "
             f"xyz_mm {format_axis_metrics(metrics['xyz_mae_mm'], ('x', 'y', 'z'))} | "
             f"rpy_deg {format_axis_metrics(metrics['rpy_mae_deg'], ('roll', 'pitch', 'yaw'))} | "
             f"early_stop {early_stop_text}",
@@ -286,6 +295,10 @@ def write_loss_artifacts(output_dir: Path, model_name: str, history: list[dict])
         "val_loss",
         "val_xyz_loss",
         "val_rpy_loss",
+        "train_mean_xyz_mae_mm",
+        "train_mean_rpy_mae_deg",
+        "val_mean_xyz_mae_mm",
+        "val_mean_rpy_mae_deg",
     ]
 
     with history_path.open("w", encoding="utf-8", newline="") as handle:
@@ -498,6 +511,7 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
         running_xyz_loss = 0.0
         running_rpy_loss = 0.0
         running_count = 0
+        running_abs_error_sum = torch.zeros(6, device=device)
         for batch in train_loader:
             images, labels = to_device(batch, device)
             pred = model(images)
@@ -509,11 +523,17 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
             running_loss += float(loss.item()) * count
             running_xyz_loss += float(loss_parts["xyz_loss"].item()) * count
             running_rpy_loss += float(loss_parts["rpy_loss"].item()) * count
+            running_abs_error_sum += torch.abs(pred.detach() - labels).sum(dim=0)
             running_count += count
 
         train_loss = running_loss / max(1, running_count)
         train_xyz_loss = running_xyz_loss / max(1, running_count)
         train_rpy_loss = running_rpy_loss / max(1, running_count)
+        train_mae = running_abs_error_sum / max(1, running_count)
+        train_metrics = {
+            "xyz_mae_mm": (train_mae[:3] * 1000.0).detach().cpu().tolist(),
+            "rpy_mae_deg": torch.rad2deg(train_mae[3:]).detach().cpu().tolist(),
+        }
         metrics = evaluate(model, val_loader, device, loss_fn)
         history.append(
             {
@@ -524,6 +544,10 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
                 "val_loss": metrics["loss"],
                 "val_xyz_loss": metrics["xyz_loss"],
                 "val_rpy_loss": metrics["rpy_loss"],
+                "train_mean_xyz_mae_mm": mean_metric(train_metrics["xyz_mae_mm"]),
+                "train_mean_rpy_mae_deg": mean_metric(train_metrics["rpy_mae_deg"]),
+                "val_mean_xyz_mae_mm": mean_metric(metrics["xyz_mae_mm"]),
+                "val_mean_rpy_mae_deg": mean_metric(metrics["rpy_mae_deg"]),
             }
         )
         scheduler.step(metrics["loss"])
@@ -561,6 +585,7 @@ def train_one_model(args, model_name: str, connector: str, output_dir: Path) -> 
                 train_loss=train_loss,
                 train_xyz_loss=train_xyz_loss,
                 train_rpy_loss=train_rpy_loss,
+                train_metrics=train_metrics,
                 metrics=metrics,
                 epochs_without_improvement=epochs_without_improvement,
                 early_stopping_patience=args.early_stopping_patience,
